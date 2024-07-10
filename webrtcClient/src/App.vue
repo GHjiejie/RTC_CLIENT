@@ -1,91 +1,135 @@
 <template>
   <div class="main">
-    <input @keyup.enter="joinRoom" v-model="roomId">输入房间号</input>
+    <input @keyup.enter="joinRoom" v-model="roomId" placeholder="输入房间号" />
   </div>
   <div class="video">
     <video ref="localVideo" autoplay></video>
-    <video v-for="stream in remoteStreams" :srcObject="stream" autoplay></video>
+    <video
+      v-for="(stream, index) in remoteStreams"
+      :key="index"
+      :ref="'remoteVideo' + index"
+      autoplay
+    ></video>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive } from "vue";
-import io from "socket.io-client";
-const socket = io("http://localhost:3000");
+import { ref } from "vue";
+import { io } from "socket.io-client";
+
+const socket = io("wss://ahjie.com:3000");
 const roomId = ref("");
 const localVideo = ref(null);
-const remoteStreams = reactive({});
-const peerConnection=ref(null);
-
+const remoteStreams = ref([]);
+const peerConnections = ref({});
 
 // 获取本地视频流
-const getLoacalStream = async () => {
-const stream =await navigator.mediaDevices.getUserMedia({
-  video: true,
-  audio: true,
-})
-// 将本地视频流添加到video标签
-localVideo.value.srcObject = stream;
-localVideo.value.play();
+const getLocalStream = async () => {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: true,
+    audio: true,
+  });
+  // 将本地视频流添加到video标签
+  localVideo.value.srcObject = stream;
+  localVideo.value.play();
+  return stream;
 };
-const joinRoom=async()=>{
+
+const createPeerConnection = (socketId) => {
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      {
+        urls: "stun:stun.l.google.com:19302",
+      },
+    ],
+  });
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      socket.emit("iceCandidate", {
+        candidate: event.candidate,
+        roomId: roomId.value,
+        socketId: socketId,
+      });
+    }
+  };
+
+  pc.ontrack = (event) => {
+    if (
+      !remoteStreams.value.some((stream) => stream.id === event.streams[0].id)
+    ) {
+      remoteStreams.value.push(event.streams[0]);
+    }
+  };
+
+  return pc;
+};
+
+const joinRoom = async () => {
   console.log("joinRoom");
-  // socket.emit("joinRoom", "123");
   socket.emit("joinRoom", roomId.value);
 
-  // console.log("添加本地流到peerConnection前",peerConnection.value);
-  await getLoacalStream();
+  const localStream = await getLocalStream();
 
-  // 创建RTCPeerConnection 对象,用于建立点对点连接
- peerConnection.value = new RTCPeerConnection({
-  iceServers: [
-    {
-      urls: "stun:stun.l.google.com:19302",
-    },
-  ],
-});
+  socket.on("allUsers", (users) => {
+    users.forEach((socketId) => {
+      const pc = createPeerConnection(socketId);
+      localStream
+        .getTracks()
+        .forEach((track) => pc.addTrack(track, localStream));
+      peerConnections.value[socketId] = pc;
+    });
+  });
 
+  socket.on("userJoined", (socketId) => {
+    const pc = createPeerConnection(socketId);
+    localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+    peerConnections.value[socketId] = pc;
+  });
 
-// 将本地流添加到RTCPeerConnection对象
-localVideo.value.srcObject.getTracks().forEach((track) => {
-  peerConnection.value.addTrack(track, localVideo.value.srcObject);
-});
+  socket.on("offer", async (data) => {
+    const { offer, socketId } = data;
+    const pc =
+      peerConnections.value[socketId] || createPeerConnection(socketId);
+    await pc.setRemoteDescription(offer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit("answer", { answer, socketId });
+    peerConnections.value[socketId] = pc;
+  });
 
-// console.log("添加本地流到peerConnection后",peerConnection.value);
+  socket.on("answer", async (data) => {
+    const { answer, socketId } = data;
+    const pc = peerConnections.value[socketId];
+    if (pc) {
+      await pc.setRemoteDescription(answer);
+    }
+  });
 
-// 创建offer
-const offer = await peerConnection.value.createOffer();
-// console.log("offer", offer);
-// 将offer设置为本地描述
-await peerConnection.value.setLocalDescription(offer);
-// 将offer发送给服务器
-socket.emit("offer", offer);
+  socket.on("iceCandidate", async (data) => {
+    const { candidate, socketId } = data;
+    const pc = peerConnections.value[socketId];
+    if (pc) {
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (e) {
+        console.error("Error adding received ice candidate", e);
+      }
+    }
+  });
 
-// 监听对方返回的offer
-socket.on('offer',async(offer)=>{
-  console.log("收到offer",offer);
-  // 设置远端描述
-  await peerConnection.value.setRemoteDescription(offer);
-  // 创建answer
-  const answer=await peerConnection.value.createAnswer();
-  // console.log("answer",answer);
-  // 设置本地描述
-  await peerConnection.value.setLocalDescription(answer);
-  // 发送answer
-  socket.emit("answer",answer);
-})
-
-// 监听对方返回的answer
-socket.on('answer',async(answer)=>{
-  console.log("收到answer",answer);
-  // 设置远端描述
-  await peerConnection.value.setRemoteDescription(answer);
-})
-
-
-
-
-}
+  socket.on("disconnect", (socketId) => {
+    console.log("Disconnected from server");
+    const pc = peerConnections.value[socketId];
+    if (pc) {
+      pc.close();
+      delete peerConnections.value[socketId];
+    }
+    remoteStreams.value = remoteStreams.value.filter(
+      (stream) => stream.id !== socketId
+    );
+  });
+};
 </script>
 
 <style>
